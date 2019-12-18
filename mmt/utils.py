@@ -2,7 +2,7 @@
 Utility functions used by StereoFeatureTracker.
 """
 import numpy as np
-from camview import CameraView
+from mmt.camview import CameraView
 
 
 def load_stereo_views(stereo_calib_file='Stereo_calibration.npz'):

@@ -1,5 +1,5 @@
 from setuptools import setup, Extension, find_packages
-
+from mmt import __version__
 
 requirements = [
     'setuptools>=18.0',
