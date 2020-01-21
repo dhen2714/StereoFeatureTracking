@@ -1,10 +1,11 @@
 from setuptools import setup, Extension, find_packages
 from mmt import __version__
 
+
 requirements = [
     'setuptools>=18.0',
-    'opencv-python==3.4.2.17',
-    'opencv-contrib-python==3.4.2.17',
+    'opencv-python<=3.4.2.17',
+    'opencv-contrib-python<=3.4.2.17',
     'pandas',
     'sklearn',
     'numpy',
