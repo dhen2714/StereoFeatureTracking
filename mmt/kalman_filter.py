@@ -87,6 +87,7 @@ class LinearKalmanFilter:
 
         self.current_state = x_post
         self.state_covariance = P_post
+        return self.state
 
     def save_diagnostics(self, output_filename):
         """
