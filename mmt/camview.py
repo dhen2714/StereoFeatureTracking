@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import time
-from sklearn.preprocessing import normalize
 
 
 def time_method(method):
