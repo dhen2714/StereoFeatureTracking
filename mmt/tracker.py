@@ -1,21 +1,20 @@
+import sys
+import os
+import time
+import logging
 import pandas as pd
 import cv2
-from sklearn.preprocessing import normalize
 import numpy as np
 from mmt.camview import CameraView
 from mmt.kalman_filter import LinearKalmanFilter
 from mmt.utils import load_stereo_views, mdot, mat2vec, vec2mat, detect_outliers
 from mmt.database import LandmarkDatabase
-import sys
-import os
-import time
 
 
 class StereoFeatureTracker:
 
-    def __init__(self, view1, view2, filtering=False, model_velocity=False):
-        assert all([isinstance(view, CameraView) for view in (view1, view2)]), \
-            'Arguments must be CameraView objects!'
+    def __init__(self, view1=None, view2=None, filtering=False, 
+        model_velocity=False):
         self.view1 = view1
         self.view2 = view2
         self.database = LandmarkDatabase(np.array([]), np.array([]))
@@ -57,17 +56,28 @@ class StereoFeatureTracker:
         self.aggregate = (1, np.zeros(6, dtype=np.float64),
                           np.zeros(6, dtype=np.float64))
 
+        # Logging
+        self.logger = logging.getLogger(__name__)
+
         # Compute rectifying transforms.
-        try:
+        if self.view1 and self.view2:
             Prec1, Prec2, self.Tr1, self.Tr2 = self.rectify_fusiello()
             DD1, DD2 = self.generate_dds(self.Tr1, self.Tr2)
             Prec1, Prec2, self.Tr1, self.Tr2 = self.rectify_fusiello(DD1, DD2)
-            print('Rectifying transforms successfully calculated.')
-        except TypeError:
-            print('Projection matrices could not be rectified! Re-check that ' +
-                  'they have been entered correctly!')
+            self.logger.debug('Rectifying transforms successfully calculated.')
+        else:
+            self.logger.debug('View1 and View2 objects not loaded!')
 
-        print('StereoFeatureTracker initialized.\n')
+        self.logger.info('StereoFeatureTracker initialised.')
+
+    def load_views(self, view1, view2):
+        """Load stereo views and calculate rectifying transforms."""
+        self.view1 = view1
+        self.view2 = view2
+        Prec1, Prec2, self.Tr1, self.Tr2 = self.rectify_fusiello()
+        DD1, DD2 = self.generate_dds(self.Tr1, self.Tr2)
+        Prec1, Prec2, self.Tr1, self.Tr2 = self.rectify_fusiello(DD1, DD2)
+        self.logger.debug('Rectifying transforms successfully calculated.')
 
     def set_detectors(self, detector):
         self.view1.set_detAndDes(detector)
@@ -116,10 +126,7 @@ class StereoFeatureTracker:
             self.view1.descriptors[in1] = ((self.view1.descriptors[in1] +
                                             self.view2.descriptors[in2])/2)
             self.view2.descriptors[in2] = self.view1.descriptors[in1].copy()
-            # self.view2.descriptors[in2] = normalize((self.view1.descriptors[in1] +
-            #                                          self.view2.descriptors[in2])/2)
-            # self.view2.descriptors[in2] = self.view1.descriptors[in1]
-            # frameDescriptors = normalize((self.view1.descriptors[in1] + self.view2.descriptors[in2])/2)
+
             frameDescriptors = self.view1.descriptors[in1].copy()
 
             # Triangulate intra-frame matched keypoints.
@@ -169,10 +176,15 @@ class StereoFeatureTracker:
         n_used_landmarks1 = len(used_landmarks1)
         n_used_landmarks2 = len(used_landmarks2)
 
-        print('\nPose estimate for frame {} is:\n {} \n'.format(
-            self.frameNumber, self.currentPose))
+        self.logger.info(
+            ('\nPose estimate for frame {} is:\n {} \n'.format(
+                self.frameNumber, self.currentPose
+            ))
+        )
 
-        print('{} landmarks in database.\n'.format(len(self.database)))
+        self.logger.info(
+            ('{} landmarks in database.\n'.format(len(self.database)))
+        )
 
         # Save pose history
         if save_poses:
@@ -325,8 +337,10 @@ class StereoFeatureTracker:
                 pose_change = np.abs(mat2vec(H) - self.currentPose)
                 # Reject new pose if change from previous pose is too high
                 if (pose_change > self.pose_threshold).any():
-                    print('Pose change larger than threshold, returning' +
-                          ' previous pose')
+                    self.logger.info(
+                        'Pose change larger than threshold, returning' +
+                        ' previous pose'
+                    )
                     db_index_used = np.array([], dtype=int)
                     flag = 1
                 else:
@@ -341,14 +355,14 @@ class StereoFeatureTracker:
                     landmarksNew = mdot(np.linalg.inv(H), landmarksNew.T).T
                     self.database.update(landmarksNew, landmarkDescriptorsNew)
                     usedKeypoints = len(XMatched)
-                    print('USED KEYPOINTS PARAM:', usedKeypoints)
-                    print('DB INDEX USED:', len(db_index_used))
+                    self.logger.debug(('USED KEYPOINTS PARAM:', usedKeypoints))
+                    self.logger.debug(('DB INDEX USED:', len(db_index_used)))
             else:
-                print('Not enough matches with database, returning previous pose\n')
+                self.logger.info('Not enough matches with database, returning previous pose\n')
                 db_index_used = np.array([], dtype=int)
                 flag = 1
         else:
-            print('Not enough matches with database, returning previous pose\n')
+            self.logger.info('Not enough matches with database, returning previous pose\n')
             db_index_used = np.array([], dtype=int)
             flag = 1
         poseEstTime = time.perf_counter() - poseEstStart
@@ -393,8 +407,8 @@ class StereoFeatureTracker:
 
         dbIdx1, frameIdx1 = self.extract_match_indices(matches_view1db)
         dbIdx2, frameIdx2 = self.extract_match_indices(matches_view2db)
-        print('Number of db matches view1:', len(frameIdx1))
-        print('Number of db matches view2:', len(frameIdx2))
+        self.logger.debug(('Number of db matches view1:', len(frameIdx1)))
+        self.logger.debug(('Number of db matches view2:', len(frameIdx2)))
         matchDBTime = time.perf_counter() - matchDBStart
 
         # Estimate pose
@@ -432,7 +446,9 @@ class StereoFeatureTracker:
                     abs_pix_thresh
                 )
         else:
-            print('No matches with database, returning previous pose.\n')
+            self.logger.info(
+                'No matches with database, returning previous pose.\n'
+            )
             used_landmarks1 = np.array([], dtype=int)
             used_landmarks2 = np.array([], dtype=int)
             poseEstTime = 0
@@ -506,9 +522,9 @@ class StereoFeatureTracker:
             key_coords2 = self.view2.key_coords[key_index2]
 
             if self.verbose:
-                print('GN Iteration number:', i + 1)
-                print('Used keypoints view1:', used_landmarks1)
-                print('Used keypoints view2:', used_landmarks2,'\n')
+                self.logger.debug(('GN Iteration number:', i + 1))
+                self.logger.debug(('Used keypoints view1:', used_landmarks1))
+                self.logger.debug(('Used keypoints view2:', used_landmarks2,'\n'))
 
             if used_landmarks1 + used_landmarks2 < 3:
                 if (len(self.database)) == 0 and (self.currentPose == 0).all():
