@@ -21,12 +21,31 @@ class StereoFeatureTracker:
         self.currentPose = np.zeros(6, dtype=np.float64)  # rX, rY, rZ, X, Y, Z
         self.frameNumber = 0
 
-        self.matches_inframe = []  # Could be useful for diagnostic purposes
-        self.matches_db_view1 = []
-        self.matches_db_view2 = []
+        # Could be useful for diagnostic purposes
+        self.matches_inframe = np.array([])  
+        self.matches_db_view1 = np.array([])
+        self.matches_db_view2 = np.array([])
+        # v1 keypoint indices matched inframe
+        self.triangulated_indexv1 = np.array([]) 
+        self.triangulated_indexv2 = np.array([])
+        # Triangulated landmarks current frame
+        self.triangulated_lmpos = np.array([])
+        self.triangulated_lmdes = np.array([])
         self.verbose = True
         self.metadata = []  # Timing data, size of database, etc.
         self.pose_history = [] # Past poses with flag
+
+        self.time_loadv1 = None # Time take to load image
+        self.time_loadv2 = None
+        # Time taken taken to detect and extract features
+        self.time_detectv1 = None 
+        self.time_detectv2 = None
+        self.time_correctdistv1 = None
+        self.time_correctdistv2 = None
+        self.time_match_inframe = None # Intra-frame match time
+        self.time_match_db = None # Time to match keypoints w/ database
+        self.time_pose_est = None # Time to estimate pose
+        self.time_frame = None # Total frame processing time
 
         # Attributes below are 'public'
         self.used_key_indices_1 = np.array([], dtype=int)
@@ -70,6 +89,30 @@ class StereoFeatureTracker:
 
         self.logger.info('StereoFeatureTracker initialised.')
 
+    @property
+    def metadata_frame(self):
+        """Dictionary of metadata for current frame."""
+        metadata_dict = {
+            'Frame_number': self.frameNumber,
+            'time_view1_load': self.time_loadv1,
+            'time_view2_load': self.time_loadv2,
+            'time_view1_detect': self.time_detectv1,
+            'time_view2_detect': self.time_detectv2,
+            'time_view1_correctdist': self.time_correctdistv1,
+            'time_view2_correctdist': self.time_correctdistv2,
+            'time_match_inframe': self.time_match_inframe,
+            'time_match_db': self.time_match_db,
+            'time_pose_est': self.time_pose_est,
+            'time_frame': self.time_frame,
+            'view1_nkeys': self.view1.n_keys,
+            'view2_nkeys': self.view2.n_keys,
+            'matches_inframe': len(self.matches_inframe),
+            'view1_used': len(self.used_key_indices_1),
+            'view2_used': len(self.used_key_indices_2),
+            'database_landmarks': len(self.database)
+        }
+        return metadata_dict
+
     def load_views(self, view1, view2):
         """Load stereo views and calculate rectifying transforms."""
         self.view1 = view1
@@ -83,7 +126,53 @@ class StereoFeatureTracker:
         self.view1.set_detAndDes(detector)
         self.view2.set_detAndDes(detector)
 
-    def process_frame(self, image1, image2, save_poses=True, verbose=True):
+    def get_keypoints(self, image1, image2):
+        """Detect, extract and apply distortion correciton to keypoints"""
+        self.time_loadv1, self.time_detectv1, self.time_correctdistv1 = \
+            self.view1.process_frame(image1)
+        self.time_loadv2, self.time_detectv2, self.time_correctdistv2 = \
+            self.view2.process_frame(image2)
+
+    def match_inframe(self):
+        """Perform intraframe matching on keypoints."""
+        match_inframe_start = time.perf_counter()
+        matches_inframe = self.match_descriptors(self.view1.descriptors,
+                                                 self.view2.descriptors,
+                                                 matching_type='intra_frame')
+        # Remove keypoints in view 1 that have been matched to multiple
+        # keypoints in view 2.
+        self.matches_inframe = self.remove_duplicate_matches(matches_inframe)
+        in1, in2 = self.extract_match_indices(self.matches_inframe)
+        # Apply epipolar constraint to intra-frame matches.
+        inEpi = self.epipolar_constraint(self.view1.key_coords[in1],
+                                         self.view2.key_coords[in2],
+                                         self.Tr1, self.Tr2)
+        self.triangulated_indexv1 = in1[inEpi]
+        self.triangulated_indexv2 = in2[inEpi]
+        self.time_match_inframe = time.perf_counter() - match_inframe_start
+
+    def triangulate_keypoints(self):
+        """Triangulate keypoints matched intraframe."""
+        in1 = self.triangulated_indexv1
+        in2 = self.triangulated_indexv2
+        if len(in1):
+            self.view1.descriptors[in1] = ((self.view1.descriptors[in1] +
+                                            self.view2.descriptors[in2])/2)
+            self.view2.descriptors[in2] = self.view1.descriptors[in1].copy()
+
+            self.triangulated_lmdes = self.view1.descriptors[in1].copy()
+
+            # Triangulate intra-frame matched keypoints.
+            self.triangulated_lmpos = self.triangulate_keypoints(
+                self.view1.P, self.view2.P,
+                self.view1.key_coords[in1],
+                self.view2.key_coords[in2]
+            )
+        else:
+            self.triangulated_lmdes = np.array([])
+            self.triangulated_lmpos = np.array([])
+
+    def process_frame(self, image1, image2, save_poses=True):
         """
         Method to process a new frame, calculating a new pose estimate. If
         save_poses is True, poses are saved to pose_history.
@@ -94,15 +183,12 @@ class StereoFeatureTracker:
             flag - 0 if pose estimated successfully, 1 otherwise.
         """
         flag = 0  # Returns 0 if pose estimated successfully
-
-        # Suppress text output if verbose=False
-        if not verbose:
-            sys.stdout = open(os.devnull, 'w')
         processFrameStart = time.perf_counter()
 
         # Update camera views, find keypoints in updated views.
         loadTime1, detTime1, correctDistTime1 = self.view1.process_frame(image1)
         loadTime2, detTime2, correctDistTime2 = self.view2.process_frame(image2)
+        self.get_keypoints(image1, image2)
 
         # Perform intra-frame matching, get indices of matched keypoints.
         matchFrameStart = time.perf_counter()
@@ -192,25 +278,22 @@ class StereoFeatureTracker:
                                       flag])
 
         # Save metadata for current frame.
-        frame_metadata = (self.frameNumber,
-                          loadTime1, loadTime2,
-                          detTime1, detTime2,
-                          correctDistTime1, correctDistTime2,
-                          matchFrameTime,
-                          matchDBTime,
-                          poseEstTime,
-                          processFrameTime,
-                          self.view1.n_keys, self.view2.n_keys,
-                          len(in1),
-                          n_used_landmarks1, n_used_landmarks2,
-                          len(self.database))
+        # frame_metadata = (self.frameNumber,
+        #                   loadTime1, loadTime2,
+        #                   detTime1, detTime2,
+        #                   correctDistTime1, correctDistTime2,
+        #                   matchFrameTime,
+        #                   matchDBTime,
+        #                   poseEstTime,
+        #                   processFrameTime,
+        #                   self.view1.n_keys, self.view2.n_keys,
+        #                   len(in1),
+        #                   n_used_landmarks1, n_used_landmarks2,
+        #                   len(self.database))
 
-        self.metadata.append(frame_metadata)
+        # self.metadata.append(frame_metadata)
+        self.metadata.append(self.metadata_frame)
         self.frameNumber += 1  # Update frame number.
-
-        # Return text output to normal if verbosity was set to false.
-        if not verbose:
-            sys.stdout = sys.__stdout__
         return self.currentPose, flag
 
     def save_poses(self, filePath):
@@ -225,19 +308,22 @@ class StereoFeatureTracker:
         """
         Saves metadata as a pandas dataframe, serialized in pickle format.
         """
-        pd.DataFrame(data=np.array(self.metadata)[:, 1:],
-                     columns=['View1 load(s)', 'View2 load(s)',
-                              'View1 det/des(s)', 'View2 det/des(s)',
-                              'View1 distcorr(s)', 'View2 distcorr(s)',
-                              'Frame match(s)',
-                              'Database match(s)',
-                              'Pose est(s)',
-                              'Frame process(s)',
-                              '#View1 keypoints', '#View2 keypoints',
-                              '#Intra-frame matches',
-                              '#View1 keypoints used', '#View2 keypoints used',
-                              '#landmarks in database'],
-                     index=np.array(self.metadata)[:, 0]).to_pickle(filePath)
+        # pd.DataFrame(data=np.array(self.metadata)[:, 1:],
+        #              columns=['View1 load(s)', 'View2 load(s)',
+        #                       'View1 det/des(s)', 'View2 det/des(s)',
+        #                       'View1 distcorr(s)', 'View2 distcorr(s)',
+        #                       'Frame match(s)',
+        #                       'Database match(s)',
+        #                       'Pose est(s)',
+        #                       'Frame process(s)',
+        #                       '#View1 keypoints', '#View2 keypoints',
+        #                       '#Intra-frame matches',
+        #                       '#View1 keypoints used', '#View2 keypoints used',
+        #                       '#landmarks in database'],
+        #              index=np.array(self.metadata)[:, 0]).to_pickle(filePath)
+        df = pd.DataFrame(self.metadata)
+        df = df.set_index('Frame_number')
+        df.to_pickle(filePath)
 
     def rectify_fusiello(self, d1=np.zeros(2), d2=np.zeros(2)):
         """
@@ -521,10 +607,9 @@ class StereoFeatureTracker:
             key_coords1 = self.view1.key_coords[key_index1]
             key_coords2 = self.view2.key_coords[key_index2]
 
-            if self.verbose:
-                self.logger.debug(('GN Iteration number:', i + 1))
-                self.logger.debug(('Used keypoints view1:', used_landmarks1))
-                self.logger.debug(('Used keypoints view2:', used_landmarks2,'\n'))
+            self.logger.debug(('GN Iteration number:', i + 1))
+            self.logger.debug(('Used keypoints view1:', used_landmarks1))
+            self.logger.debug(('Used keypoints view2:', used_landmarks2))
 
             if used_landmarks1 + used_landmarks2 < 3:
                 if (len(self.database)) == 0 and (self.currentPose == 0).all():
