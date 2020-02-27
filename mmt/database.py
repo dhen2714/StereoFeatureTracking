@@ -25,6 +25,12 @@ class LandmarkDatabase:
     def __len__(self):
         return len(self.landmarks)
 
+    def is_empty(self):
+        if len(self):
+            return False
+        else:
+            return True
+
     def update(self, X, descriptors, landmarks_used=None):
         if len(self) == 0:
             self.landmarks = X
