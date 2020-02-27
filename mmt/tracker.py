@@ -19,7 +19,7 @@ class StereoFeatureTracker:
         self.view2 = view2
         self.database = LandmarkDatabase(np.array([]), np.array([]))
         self.currentPose = np.zeros(6, dtype=np.float64)  # rX, rY, rZ, X, Y, Z
-        self.frameNumber = 0
+        self.frame_number = 0
 
         # Could be useful for diagnostic purposes
         self.matches_inframe = np.array([])  
@@ -48,8 +48,10 @@ class StereoFeatureTracker:
         self.time_frame = None # Total frame processing time
 
         # Attributes below are 'public'
-        self.used_key_indices_1 = np.array([], dtype=int)
-        self.used_key_indices_2 = np.array([], dtype=int)
+        self.used_key_indices1 = np.array([], dtype=int)
+        self.used_key_indices2 = np.array([], dtype=int)
+        self.used_db_indices1 = np.array([], dtype=int)
+        self.used_db_indices2 = np.array([], dtype=int)
 
         # est_method can be set to either 'gn' or 'ls'. 'ls' uses Horn's method
         # to estimate pose, whereas 'gn' uses least squares minimisation with
@@ -93,7 +95,7 @@ class StereoFeatureTracker:
     def metadata_frame(self):
         """Dictionary of metadata for current frame."""
         metadata_dict = {
-            'Frame_number': self.frameNumber,
+            'Frame_number': self.frame_number,
             'time_view1_load': self.time_loadv1,
             'time_view2_load': self.time_loadv2,
             'time_view1_detect': self.time_detectv1,
@@ -107,8 +109,8 @@ class StereoFeatureTracker:
             'view1_nkeys': self.view1.n_keys,
             'view2_nkeys': self.view2.n_keys,
             'matches_inframe': len(self.matches_inframe),
-            'view1_used': len(self.used_key_indices_1),
-            'view2_used': len(self.used_key_indices_2),
+            'view1_used': len(self.used_db_indices1),
+            'view2_used': len(self.used_db_indices2),
             'database_landmarks': len(self.database)
         }
         return metadata_dict
@@ -127,7 +129,7 @@ class StereoFeatureTracker:
         self.view2.set_detAndDes(detector)
 
     def get_keypoints(self, image1, image2):
-        """Detect, extract and apply distortion correciton to keypoints"""
+        """Detect, extract and apply distortion correction to keypoints"""
         self.time_loadv1, self.time_detectv1, self.time_correctdistv1 = \
             self.view1.process_frame(image1)
         self.time_loadv2, self.time_detectv2, self.time_correctdistv2 = \
@@ -151,7 +153,7 @@ class StereoFeatureTracker:
         self.triangulated_indexv2 = in2[inEpi]
         self.time_match_inframe = time.perf_counter() - match_inframe_start
 
-    def triangulate_keypoints(self):
+    def triangulate_matches(self):
         """Triangulate keypoints matched intraframe."""
         in1 = self.triangulated_indexv1
         in2 = self.triangulated_indexv2
@@ -172,6 +174,31 @@ class StereoFeatureTracker:
             self.triangulated_lmdes = np.array([])
             self.triangulated_lmpos = np.array([])
 
+    def estimate_pose(self):
+        """Estimate current pose."""
+        if self.frame_number == 0 or self.database.is_empty():
+            self.database.update(
+                self.triangulated_lmpos, 
+                self.triangulated_lmdes
+            )
+            v1, v2, v3, v4 = 0, 0, np.array([]), np.array([])
+        elif self.est_method is None:
+            pass
+        elif self.est_method == 'ls':
+            v1, v2, v3v4, flag = self.estimate_pose_ls()
+            v3, v4 = v3v4, v3v4
+        elif self.est_method == 'gn':
+            v1, v2, v3, v4, flag = self.estimate_pose_gn()
+
+        self.time_match_db = v1
+        self.time_pose_est = v2
+        self.used_db_indices1 = v3
+        self.used_db_indices2 = v4
+        # Update landmark usage, prune landmarks that have not bee used for too
+        # many consecutive frames.
+        used_landmark_indices = np.union1d(v3, v4)
+        self.database.update_landmark_usage(v3.astype(int))
+
     def process_frame(self, image1, image2, save_poses=True):
         """
         Method to process a new frame, calculating a new pose estimate. If
@@ -185,115 +212,31 @@ class StereoFeatureTracker:
         flag = 0  # Returns 0 if pose estimated successfully
         processFrameStart = time.perf_counter()
 
-        # Update camera views, find keypoints in updated views.
-        loadTime1, detTime1, correctDistTime1 = self.view1.process_frame(image1)
-        loadTime2, detTime2, correctDistTime2 = self.view2.process_frame(image2)
         self.get_keypoints(image1, image2)
-
-        # Perform intra-frame matching, get indices of matched keypoints.
-        matchFrameStart = time.perf_counter()
-        matches_inframe = self.match_descriptors(self.view1.descriptors,
-                                                 self.view2.descriptors,
-                                                 matching_type='intra_frame')
-        # Remove keypoints in view 1 that have been matched to multiple
-        # keypoints in view 2.
-        self.matches_inframe = self.remove_duplicate_matches(matches_inframe)
-        in1, in2 = self.extract_match_indices(self.matches_inframe)
-        # Apply epipolar constraint to intra-frame matches.
-        inEpi = self.epipolar_constraint(self.view1.key_coords[in1],
-                                         self.view2.key_coords[in2],
-                                         self.Tr1, self.Tr2)
-        in1 = in1[inEpi]
-        in2 = in2[inEpi]
-        matchFrameTime = time.perf_counter() - matchFrameStart
-
-        # frameDescriptors is an array of descriptors for intra-frame matches
-        if len(in1):
-            self.view1.descriptors[in1] = ((self.view1.descriptors[in1] +
-                                            self.view2.descriptors[in2])/2)
-            self.view2.descriptors[in2] = self.view1.descriptors[in1].copy()
-
-            frameDescriptors = self.view1.descriptors[in1].copy()
-
-            # Triangulate intra-frame matched keypoints.
-            X = self.triangulate_keypoints(self.view1.P, self.view2.P,
-                                           self.view1.key_coords[in1],
-                                           self.view2.key_coords[in2])
-        else:
-            frameDescriptors = np.array([])
-            X = np.array([])
-
-        # Estimate current pose
-        if self.frameNumber == 0:
-
-            self.database.update(X, frameDescriptors)
-            matchDBTime, poseEstTime, used_landmarks1, used_landmarks2 \
-                = 0, 0, np.array([]), np.array([])
-
-        # Estimate pose using Horn's method, finding the required transformation
-        # between triangulated points in current frame and matched landmarks in
-        # the database.
-        elif self.est_method == 'ls':
-
-            matchDBTime, poseEstTime, used_landmarks, flag = \
-                self.estimate_pose_ls(X, frameDescriptors)
-            used_landmarks1 = used_landmarks
-            used_landmarks2 = used_landmarks
-
-        # Estimate pose using Gauss-Newton iterations, finding required
-        # transformation that minimizes pixel projection error between keypoints
-        # and matched landmarks in database.
-        elif self.est_method == 'gn':
-
-            matchDBTime, poseEstTime, used_landmarks1, used_landmarks2, flag = \
-                self.estimate_pose_gn(X, frameDescriptors, in1, in2)
-
-        # Update landmark usage, prune landmarks that have not bee used for too
-        # many consecutive frames.
-        used_landmark_indices = np.union1d(used_landmarks1, used_landmarks2)
-        self.database.update_landmark_usage(used_landmark_indices.astype(int))
-
+        self.match_inframe()
+        self.triangulate_matches()
+        self.estimate_pose()
         # Running variance and mean used for weighted least squares estimation
         # in GN estimation.
         self.update_aggregate()
 
-        processFrameTime = time.perf_counter() - processFrameStart
-
-        n_used_landmarks1 = len(used_landmarks1)
-        n_used_landmarks2 = len(used_landmarks2)
+        self.time_frame = time.perf_counter() - processFrameStart
 
         self.logger.info(
             ('\nPose estimate for frame {} is:\n {} \n'.format(
-                self.frameNumber, self.currentPose
+                self.frame_number, self.currentPose
             ))
         )
-
         self.logger.info(
             ('{} landmarks in database.\n'.format(len(self.database)))
         )
-
         # Save pose history
         if save_poses:
-            self.pose_history.append([self.frameNumber, *self.currentPose,
+            self.pose_history.append([self.frame_number, *self.currentPose,
                                       flag])
 
-        # Save metadata for current frame.
-        # frame_metadata = (self.frameNumber,
-        #                   loadTime1, loadTime2,
-        #                   detTime1, detTime2,
-        #                   correctDistTime1, correctDistTime2,
-        #                   matchFrameTime,
-        #                   matchDBTime,
-        #                   poseEstTime,
-        #                   processFrameTime,
-        #                   self.view1.n_keys, self.view2.n_keys,
-        #                   len(in1),
-        #                   n_used_landmarks1, n_used_landmarks2,
-        #                   len(self.database))
-
-        # self.metadata.append(frame_metadata)
         self.metadata.append(self.metadata_frame)
-        self.frameNumber += 1  # Update frame number.
+        self.frame_number += 1  # Update frame number.
         return self.currentPose, flag
 
     def save_poses(self, filePath):
@@ -308,19 +251,6 @@ class StereoFeatureTracker:
         """
         Saves metadata as a pandas dataframe, serialized in pickle format.
         """
-        # pd.DataFrame(data=np.array(self.metadata)[:, 1:],
-        #              columns=['View1 load(s)', 'View2 load(s)',
-        #                       'View1 det/des(s)', 'View2 det/des(s)',
-        #                       'View1 distcorr(s)', 'View2 distcorr(s)',
-        #                       'Frame match(s)',
-        #                       'Database match(s)',
-        #                       'Pose est(s)',
-        #                       'Frame process(s)',
-        #                       '#View1 keypoints', '#View2 keypoints',
-        #                       '#Intra-frame matches',
-        #                       '#View1 keypoints used', '#View2 keypoints used',
-        #                       '#landmarks in database'],
-        #              index=np.array(self.metadata)[:, 0]).to_pickle(filePath)
         df = pd.DataFrame(self.metadata)
         df = df.set_index('Frame_number')
         df.to_pickle(filePath)
@@ -329,11 +259,8 @@ class StereoFeatureTracker:
         """
         Translation of Andre's IDL function rectify_fusello.
         """
-        try:
-            K1, R1, C1, _, _, _, _ = cv2.decomposeProjectionMatrix(self.view1.P)
-            K2, R2, C2, _, _, _, _ = cv2.decomposeProjectionMatrix(self.view2.P)
-        except:
-            return
+        K1, R1, C1, _, _, _, _ = cv2.decomposeProjectionMatrix(self.view1.P)
+        K2, R2, C2, _, _, _, _ = cv2.decomposeProjectionMatrix(self.view2.P)
 
         C1 = cv2.convertPointsFromHomogeneous(C1.T).reshape(3, 1)
         C2 = cv2.convertPointsFromHomogeneous(C2.T).reshape(3, 1)
@@ -358,23 +285,22 @@ class StereoFeatureTracker:
         Kn2[0, 2] = Kn2[0, 2] + d2[0]
         Kn2[1, 2] = Kn2[1, 2] + d2[1]
 
-        t1 = np.matmul(-R, C1)
-        t2 = np.matmul(-R, C2)
-        Rt1 = np.concatenate((R, t1), 1)
-        Rt2 = np.concatenate((R, t2), 1)
-        Prec1 = np.dot(Kn1, Rt1)
-        Prec2 = np.dot(Kn2, Rt2)
+        t1, t2 = np.matmul(-R, C1), np.matmul(-R, C2)
+        Rt1, Rt2 = np.concatenate((R, t1), 1), np.concatenate((R, t2), 1)
+        Prec1, Prec2 = np.dot(Kn1, Rt1), np.dot(Kn2, Rt2)
 
         Tr1 = np.dot(Prec1[:3, :3], np.linalg.inv(self.view1.P[:3, :3]))
         Tr2 = np.dot(Prec2[:3, :3], np.linalg.inv(self.view2.P[:3, :3]))
         return Prec1, Prec2, Tr1, Tr2
 
-    def estimate_pose_ls(self, X, frameDescriptors):
+    def estimate_pose_ls(self):
         """
         Estimate pose using Horn's method. Returns time taken to match
         descriptors with database, time taken to estimate pose, and number of
         3D landmarks used to estimate pose.
         """
+        X = self.triangulated_lmpos
+        frameDescriptors = self.triangulated_lmdes
         flag = 0
         # Match 3D points found in current frame with database
         matchDBStart = time.perf_counter()
@@ -455,14 +381,17 @@ class StereoFeatureTracker:
 
         return matchDBTime, poseEstTime, db_index_used, flag
 
-    def estimate_pose_gn(self, X, frameDescriptors, in1, in2, n_iterations=10,
-         abs_pix_thresh=2):
+    def estimate_pose_gn(self, n_iterations=10, abs_pix_thresh=2):
         """
         Matches keypoints from view1 and view2 to database indepedently. If
         there are matches, calls GN_estimation() to calculate pose. Retuns time
         taken to match keypoints with database, time taken to estimate pose,
         and number of keypoints in view1 and view2 used to calculte pose.
         """
+        X = self.triangulated_lmpos
+        frameDescriptors = self.triangulated_lmdes
+        in1, in2 = self.triangulated_indexv1, self.triangulated_indexv2
+
         flag = 0
         matchDBStart = time.perf_counter()
 
@@ -546,10 +475,10 @@ class StereoFeatureTracker:
         # Add new entries to database
         new_landmarks = []
         old_landmarks = []
-        self.used_key_indices_1 = key_index1
-        self.used_key_indices_2 = key_index2
+        self.used_key_indices1 = key_index1
+        self.used_key_indices2 = key_index2
 
-        if self.update_db_cutoff is None or self.frameNumber < self.update_db_cutoff:
+        if self.update_db_cutoff is None or self.frame_number < self.update_db_cutoff:
             if len(in1) and flag == 0:
                 for i in range(len(in1)):
                     if (in1[i] not in frameIdx1_raw) and (in2[i] not in frameIdx2_raw):
