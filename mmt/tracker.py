@@ -4,6 +4,7 @@ import time
 import logging
 import pandas as pd
 import cv2
+from scipy.optimize import least_squares
 import numpy as np
 from mmt.camview import CameraView
 from mmt.kalman_filter import LinearKalmanFilter
@@ -20,6 +21,7 @@ class StereoFeatureTracker:
         self.database = LandmarkDatabase(np.array([]), np.array([]))
         self.currentPose = np.zeros(6, dtype=np.float64)  # rX, rY, rZ, X, Y, Z
         self.frame_number = 0
+        self.pose_flag = 0
 
         # Could be useful for diagnostic purposes
         self.matches_inframe = np.array([])  
@@ -56,7 +58,7 @@ class StereoFeatureTracker:
         # est_method can be set to either 'gn' or 'ls'. 'ls' uses Horn's method
         # to estimate pose, whereas 'gn' uses least squares minimisation with
         # iterations of the Gauss-Newton method
-        self.est_method = 'gn'
+        self.est_method = None
         self.ratioTest = True  # Apply ratio test in descriptor matching
         self.distRatio = 0.6  # Distance ratio cutoff for ratio test
         self.binaryMatch = False  # Use Hamming norm instead of L2
@@ -174,6 +176,81 @@ class StereoFeatureTracker:
             self.triangulated_lmdes = np.array([])
             self.triangulated_lmpos = np.array([])
 
+    def match_views_database(self):
+        """Match detected keypoints with database descriptors."""
+        flag = 0
+        match_db_start = time.perf_counter()
+        matches_view1db = self.match_descriptors(self.database.descriptors,
+                                                 self.view1.descriptors,
+                                                 matching_type='database')
+        matches_view2db = self.match_descriptors(self.database.descriptors,
+                                                 self.view2.descriptors,
+                                                 matching_type='database')
+        dbIdx1_raw, fIdx1_raw = self.extract_match_indices(matches_view1db)
+        dbIdx2_raw, fIdx2_raw = self.extract_match_indices(matches_view2db)
+        self.matches_db_view1 = matches_view1db
+        self.matches_db_view2 = matches_view2db
+        matches_view1db = self.remove_duplicate_matches(matches_view1db)
+        matches_view2db = self.remove_duplicate_matches(matches_view2db)
+        dbIdx1, fIdx1 = self.extract_match_indices(matches_view1db)
+        dbIdx2, fIdx2 = self.extract_match_indices(matches_view2db)
+        self.logger.debug(('Number of db matches view1:', len(fIdx1)))
+        self.logger.debug(('Number of db matches view2:', len(fIdx2)))
+        self.used_db_indices1, self.used_db_indices2 = dbIdx1, dbIdx2
+        self.used_key_indices1, self.used_key_indices2 = fIdx1, fIdx2
+        self.time_match_db = time.perf_counter() - match_db_start
+
+    @staticmethod
+    def scipy_nlls_fun(x, pose_est, P1, P2, key_coords1, key_coords2, dblm1, dblm2):
+        """
+        Non linear least squares function called by estimate_pose_nlls
+        x is array-like pose
+        """
+        H = vec2mat(x + pose_est)
+        projections1 = mdot(P1, H, dblm1.T)
+        projections2 = mdot(P2, H, dblm2.T)
+        projections1 = np.apply_along_axis(lambda v: v/v[-1], 0, projections1)
+        projections2 = np.apply_along_axis(lambda v: v/v[-1], 0, projections2)
+        res1 = (projections1[:2, :] - key_coords1.T).flatten(order='F')
+        res2 = (projections2[:2, :] - key_coords2.T).flatten(order='F')
+
+        if res1.size and res2.size:
+            res = np.concatenate((res1, res2))
+        elif res1.size:
+            res = res1
+        elif res2.size:
+            res = res2
+        return res
+
+    def estimate_pose_nlls(self):
+        """Estimate pose using scipy least squares."""
+        self.match_views_database()
+        P1, P2 = self.view1.P, self.view2.P
+        keys1 = self.view1.key_coords[self.used_key_indices1]
+        keys2 = self.view2.key_coords[self.used_key_indices2]
+        dblm1 = self.database.landmarks[self.used_db_indices1]
+        dblm2 = self.database.landmarks[self.used_db_indices2]
+        pose_est = self.currentPose
+        x0 = np.zeros(6)
+
+        pose_est_start = time.perf_counter()
+        result = least_squares(
+            self.scipy_nlls_fun,
+            x0,
+            jac='2-point',
+            loss='cauchy',
+            args=(pose_est, P1, P2, keys1, keys2, dblm1, dblm2)
+        )
+        self.pose_flag = int(not result.success)
+
+        if result.success:
+            self.currentPose = result.x + self.currentPose
+        else:
+            self.logger.info(
+                'Pose estimation not successful, returning previous.'
+            )
+        self.time_pose_est = time.perf_counter() - pose_est_start
+
     def estimate_pose(self):
         """Estimate current pose."""
         if self.frame_number == 0 or self.database.is_empty():
@@ -183,21 +260,21 @@ class StereoFeatureTracker:
             )
             v1, v2, v3, v4 = 0, 0, np.array([]), np.array([])
         elif self.est_method is None:
-            pass
+            self.estimate_pose_nlls()
         elif self.est_method == 'ls':
             v1, v2, v3v4, flag = self.estimate_pose_ls()
             v3, v4 = v3v4, v3v4
         elif self.est_method == 'gn':
             v1, v2, v3, v4, flag = self.estimate_pose_gn()
 
-        self.time_match_db = v1
-        self.time_pose_est = v2
-        self.used_db_indices1 = v3
-        self.used_db_indices2 = v4
+        # self.time_match_db = v1
+        # self.time_pose_est = v2
+        # self.used_db_indices1 = v3
+        # self.used_db_indices2 = v4
         # Update landmark usage, prune landmarks that have not bee used for too
         # many consecutive frames.
-        used_landmark_indices = np.union1d(v3, v4)
-        self.database.update_landmark_usage(v3.astype(int))
+        # used_landmark_indices = np.union1d(v3, v4)
+        # self.database.update_landmark_usage(v3.astype(int))
 
     def process_frame(self, image1, image2, save_poses=True):
         """
