@@ -59,6 +59,8 @@ class StereoFeatureTracker:
         # to estimate pose, whereas 'gn' uses least squares minimisation with
         # iterations of the Gauss-Newton method
         self.est_method = None
+        self.residuals = None # Cost function errors
+        self.pose_covariance = None
         self.ratioTest = True  # Apply ratio test in descriptor matching
         self.distRatio = 0.6  # Distance ratio cutoff for ratio test
         self.binaryMatch = False  # Use Hamming norm instead of L2
@@ -245,7 +247,12 @@ class StereoFeatureTracker:
 
         if result.success:
             self.currentPose = result.x + self.currentPose
+            self.residuals = result.fun
+            J = result.jac
+            self.pose_covariance = np.linalg.inv(np.dot(J.T, J))
         else:
+            self.residuals = None
+            self.pose_covariance = None
             self.logger.info(
                 'Pose estimation not successful, returning previous.'
             )
